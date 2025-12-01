@@ -1,8 +1,10 @@
 """
-Automated News Analytic Agent using LangGraph and Tavily API
+Automated News Analytic Agent using LangGraph and MCP News Search
+Agentic architecture where LLM decides when and how to search for news
 """
 
 import os
+import json
 from datetime import datetime, timedelta
 from typing import TypedDict, Annotated, Sequence, List, Optional
 from textwrap import dedent
@@ -13,7 +15,16 @@ from langchain_openai import ChatOpenAI
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langgraph.prebuilt import ToolNode, create_react_agent
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
+
+from mcp_news_client import NewsSearchMCPClientSync
+try:
+    from mcp_tools import get_mcp_tools
+except ImportError:
+    # Fallback if mcp_tools not available
+    def get_mcp_tools():
+        return []
 
 load_dotenv()
 
@@ -59,48 +70,123 @@ class UserInputExtraction(BaseModel):
 
 
 class AgentState(TypedDict):
-    """State of the news analysis agent"""
+    """State of the news analysis agent - simplified for agentic workflow"""
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    topic: str
-    num_news: int
-    freshness_days: int
+    # Optional fields for backward compatibility and report generation
+    topic: Optional[str]
     search_results: List[dict]
-    summary: str
-    citations: List[dict]  # Stored as dict, validated with Citation model
-    report: str
+    summary: Optional[str]
+    citations: List[dict]
+    report: Optional[str]
 
 
 class NewsAnalyticAgent:
-    """AI Agent for automated news analysis using LangGraph and Tavily"""
+    """AI Agent for automated news analysis using LangGraph and MCP News Search
+    Agentic architecture: LLM decides when and how to search for news
+    """
     
-    def __init__(self, model_name: str = "gpt-5-nano", temperature: float = 0):
+    def __init__(self, model_name: str = "gpt-5-nano", temperature: float = 0, use_mcp: bool = True, agentic: bool = True):
         """
         Initialize the News Analytic Agent
         
         Args:
             model_name: OpenAI model to use
             temperature: Temperature for the model
+            use_mcp: Whether to use MCP client for news search (default: True)
+            agentic: Whether to use agentic architecture where LLM decides actions (default: True)
         """
         self.llm = ChatOpenAI(model=model_name, temperature=temperature)
+        self.use_mcp = use_mcp
+        self.agentic = agentic
         
-        # Initialize Tavily search tool
-        tavily_api_key = os.getenv("TAVILY_API_KEY")
-        if not tavily_api_key:
-            raise ValueError("TAVILY_API_KEY not found in environment variables")
-        
-        self.search_tool = TavilySearchResults(
-            max_results=20,
-            search_depth="advanced",
-            include_answer=False,
-            include_raw_content=True,
-            include_images=False
-        )
+        # Get tools for agentic mode
+        if agentic and use_mcp:
+            self.tools = get_mcp_tools()
+            print("   Initializing agentic MCP news search agent...")
+        elif use_mcp:
+            # Legacy mode: direct MCP client
+            print("   Initializing MCP news search client (legacy mode)...")
+            self.mcp_client = NewsSearchMCPClientSync()
+            self.tools = []
+        else:
+            # Fallback to direct Tavily integration
+            tavily_api_key = os.getenv("TAVILY_API_KEY")
+            if not tavily_api_key:
+                raise ValueError("TAVILY_API_KEY not found in environment variables")
+            
+            self.search_tool = TavilySearchResults(
+                max_results=20,
+                search_depth="advanced",
+                include_answer=False,
+                include_raw_content=True,
+                include_images=False
+            )
+            self.tools = []
+            self.mcp_client = None
         
         # Build the graph
         self.graph = self._build_graph()
     
+    def __del__(self):
+        """Cleanup MCP client on destruction"""
+        if hasattr(self, 'mcp_client') and self.mcp_client:
+            self.mcp_client.close()
+    
     def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow"""
+        """Build the LangGraph workflow - agentic or legacy"""
+        if self.agentic and self.use_mcp:
+            return self._build_agentic_graph()
+        else:
+            return self._build_legacy_graph()
+    
+    def _build_agentic_graph(self) -> StateGraph:
+        """Build agentic graph where LLM decides when to use tools"""
+        # Create system message for the agent
+        system_message = dedent("""
+            You are an expert news analyst. Your role is to help users find and analyze recent news articles.
+            
+            When a user asks about news:
+            1. Use the search_news_tool to find relevant articles
+            2. Analyze the results and provide insights
+            3. If the user wants a report, summarize the findings with citations
+            
+            You decide when to search, how many articles to retrieve, and what time range to search.
+            Be proactive in using the search tool when news information is needed.
+        """).strip()
+        
+        # Create LLM with system message and tools
+        llm_with_system = self.llm.bind_tools(self.tools)
+        
+        # Create agent with tool calling capability
+        agent = create_react_agent(
+            llm_with_system,
+            self.tools
+        )
+        
+        # Wrap agent to add system message to initial state
+        def agent_with_system(state: AgentState) -> AgentState:
+            # Add system message if not present
+            messages = list(state.get("messages", []))
+            from langchain_core.messages import SystemMessage
+            
+            # Check if system message already exists
+            has_system = any(isinstance(msg, SystemMessage) for msg in messages)
+            if not has_system:
+                messages = [SystemMessage(content=system_message)] + messages
+                state["messages"] = messages
+            
+            return agent.invoke(state)
+        
+        # Create a simple wrapper graph
+        workflow = StateGraph(AgentState)
+        workflow.add_node("agent", agent_with_system)
+        workflow.set_entry_point("agent")
+        workflow.add_edge("agent", END)
+        
+        return workflow.compile()
+    
+    def _build_legacy_graph(self) -> StateGraph:
+        """Build legacy deterministic workflow"""
         workflow = StateGraph(AgentState)
         
         # Add nodes
@@ -184,7 +270,7 @@ class NewsAnalyticAgent:
         return state
     
     def search_news(self, state: AgentState) -> AgentState:
-        """Search for news using Tavily API"""
+        """Search for news using MCP server or Tavily API"""
         print("\n[Step 2/4] 🔍 Searching for news articles...")
         topic = state.get("topic", "")
         num_news = state.get("num_news", 10)
@@ -202,33 +288,31 @@ class NewsAnalyticAgent:
         end_date = datetime.now()
         start_date = end_date - timedelta(days=freshness_days)
         
-        # Build search query with date constraints
-        search_query = f"{topic} news {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-        print(f"   Query: '{search_query}'")
+        print(f"   Query: '{topic}'")
         print(f"   Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
         print(f"   Requesting up to {num_news} articles...")
         
         try:
-            # Perform search
-            print("   Connecting to Tavily API...")
-            results = self.search_tool.invoke({
-                "query": search_query,
-                "max_results": num_news
-            })
-            print(f"   ✓ Received {len(results)} results from Tavily")
-            
-            # Filter results by date if possible and limit to num_news
-            print("   Processing and validating results...")
-            filtered_results = []
-            for i, result in enumerate(results[:num_news], 1):
-                # Check if result has date information
-                if isinstance(result, dict):
-                    # Validate and structure the result using Pydantic
+            if self.use_mcp and self.mcp_client:
+                # Use MCP client for search
+                print("   Connecting to MCP news search server...")
+                results = self.mcp_client.search_news(
+                    query=topic,
+                    num_results=num_news,
+                    date_range_days=freshness_days
+                )
+                print(f"   ✓ Received {len(results)} results from MCP server")
+                
+                # Process MCP results (already formatted)
+                print("   Processing and validating results...")
+                filtered_results = []
+                for i, result in enumerate(results, 1):
                     try:
+                        # MCP results are already dictionaries with number, title, url, content, raw_content
                         search_result = SearchResult(
                             title=result.get("title", "Untitled"),
                             url=result.get("url", ""),
-                            content=result.get("content", result.get("snippet", "")),
+                            content=result.get("content", ""),
                             raw_content=result.get("raw_content")
                         )
                         filtered_results.append(search_result.model_dump())
@@ -239,6 +323,35 @@ class NewsAnalyticAgent:
                         filtered_results.append(result)
                         if i <= 3:
                             print(f"      {i}. {result.get('title', 'Untitled')[:60]}...")
+            else:
+                # Fallback to direct Tavily integration
+                search_query = f"{topic} news {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+                print("   Connecting to Tavily API (direct)...")
+                results = self.search_tool.invoke({
+                    "query": search_query,
+                    "max_results": num_news
+                })
+                print(f"   ✓ Received {len(results)} results from Tavily")
+                
+                # Filter results by date if possible and limit to num_news
+                print("   Processing and validating results...")
+                filtered_results = []
+                for i, result in enumerate(results[:num_news], 1):
+                    if isinstance(result, dict):
+                        try:
+                            search_result = SearchResult(
+                                title=result.get("title", "Untitled"),
+                                url=result.get("url", ""),
+                                content=result.get("content", result.get("snippet", "")),
+                                raw_content=result.get("raw_content")
+                            )
+                            filtered_results.append(search_result.model_dump())
+                            if i <= 3:  # Show first 3 titles
+                                print(f"      {i}. {search_result.title[:60]}...")
+                        except Exception as e:
+                            filtered_results.append(result)
+                            if i <= 3:
+                                print(f"      {i}. {result.get('title', 'Untitled')[:60]}...")
             
             state["search_results"] = filtered_results
             
@@ -404,27 +517,43 @@ class NewsAnalyticAgent:
             user_input: User's query about news topic
             
         Returns:
-            Final state with report
+            Final state with messages and optional report
         """
         print("\n" + "=" * 60)
-        print("🚀 Starting News Analysis Workflow")
+        if self.agentic:
+            print("🚀 Starting Agentic News Analysis")
+            print("   (LLM will decide when to search and analyze)")
+        else:
+            print("🚀 Starting News Analysis Workflow")
         print("=" * 60)
         
         initial_state: AgentState = {
             "messages": [HumanMessage(content=user_input)],
-            "topic": "",
-            "num_news": 10,
-            "freshness_days": 7,
+            "topic": None,
             "search_results": [],
-            "summary": "",
+            "summary": None,
             "citations": [],
-            "report": ""
+            "report": None
         }
         
         print(f"User input: '{user_input}'")
-        print("\nExecuting workflow steps...")
+        if self.agentic:
+            print("\n🤖 Agent is thinking and deciding actions...")
+        else:
+            print("\nExecuting workflow steps...")
         
         final_state = self.graph.invoke(initial_state)
+        
+        # Extract report from messages if agentic mode
+        if self.agentic:
+            # Try to extract report from final AI message
+            messages = final_state.get("messages", [])
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    # Check if it looks like a report
+                    if "report" in msg.content.lower() or len(msg.content) > 500:
+                        final_state["report"] = msg.content
+                        break
         
         print("\n" + "=" * 60)
         print("✅ Workflow completed successfully!")
@@ -439,21 +568,28 @@ def main():
     print("Automated News Analytic Agent")
     print("=" * 60)
     print("\nThis agent will help you analyze recent news on any topic.")
-    print("You can specify:")
-    print("  - The topic/field you're interested in")
-    print("  - Number of news articles to search (default: 10)")
-    print("  - How fresh the news should be in days (default: 7)")
-    print("\nExample: 'Search for 10 news articles about AI developments in the past week'")
+    print("\n🤖 Agentic Mode: The AI will decide when to search and analyze news")
+    print("   You can ask naturally, and the agent will use tools as needed.")
+    print("\nExample queries:")
+    print("  - 'What are the latest developments in AI?'")
+    print("  - 'Find me recent news about climate change'")
+    print("  - 'Search for 10 articles about technology from the past week'")
     print("=" * 60)
 
     save_folder = 'generated_reports/'
+    os.makedirs(save_folder, exist_ok=True)
     
-    # Initialize agent
+    # Initialize agent (agentic mode by default)
     try:
-        agent = NewsAnalyticAgent()
+        agent = NewsAnalyticAgent(agentic=True, use_mcp=True)
     except ValueError as e:
         print(f"\nError: {e}")
         print("\nPlease set TAVILY_API_KEY and OPENAI_API_KEY in your .env file")
+        return
+    except Exception as e:
+        print(f"\nError initializing agent: {e}")
+        import traceback
+        traceback.print_exc()
         return
     
     # Get user input
@@ -470,19 +606,30 @@ def main():
     try:
         result = agent.run(user_input)
         
-        # Display the report
+        # Display the report or final response
         print("\n" + "=" * 60)
-        print("FINAL REPORT")
+        print("RESPONSE")
         print("=" * 60)
-        print(result.get("report", "No report generated."))
+        
+        # Get the last AI message if no report
+        if result.get("report"):
+            print(result.get("report"))
+        else:
+            messages = result.get("messages", [])
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    print(msg.content)
+                    break
+        
         print("=" * 60)
         
         # Optionally save to file
-        save = input("\nSave report to file? (y/n): ").strip().lower()
+        save = input("\nSave response to file? (y/n): ").strip().lower()
         if save == 'y':
             filename = f"news_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            content = result.get("report") or (messages[-1].content if messages else "")
             with open(os.path.join(save_folder, filename), 'w', encoding='utf-8') as f:
-                f.write(result.get("report", ""))
+                f.write(content)
             print(f"Report saved to {filename}")
     
     except Exception as e:

@@ -4,8 +4,10 @@ An AI-powered news analysis agent built with LangGraph and Tavily API that autom
 
 ## Features
 
+- **🤖 Agentic Architecture**: LLM decides when to search, what to search for, and how to analyze (NEW!)
 - **Intelligent Query Processing**: Automatically extracts topic, number of articles, and time range from natural language input
-- **Web Search Integration**: Uses Tavily API for advanced web search with date filtering
+- **MCP-Based Architecture**: News search abstracted into a local MCP (Model Context Protocol) server for modularity and extensibility
+- **Web Search Integration**: Uses Tavily API for advanced web search with date filtering (via MCP server)
 - **AI-Powered Summarization**: Leverages OpenAI models to analyze and summarize news articles
 - **Citation Management**: Automatically includes citations with URLs for all sources
 - **LangGraph Workflow**: Built on LangGraph for robust agentic orchestration
@@ -89,14 +91,71 @@ print(result["summary"])
 print(result["citations"])
 ```
 
+## Architecture
+
+The agent uses a modular MCP (Model Context Protocol) architecture with **agentic decision-making**:
+
+- **MCP Server** (`mcp_news_server.py`): Handles all news search operations via Tavily API
+- **MCP Client** (`mcp_news_client.py`): Provides a client interface to communicate with the MCP server
+- **MCP Tools** (`mcp_tools.py`): LangChain tool wrappers that expose MCP functionality to the LLM
+- **News Agent** (`news_agent.py`): Main agent that uses LangGraph's `create_react_agent` for agentic tool calling
+
+### Agentic Mode (Default)
+
+In agentic mode, the LLM:
+- **Decides when to search**: Only searches when news information is needed
+- **Chooses search parameters**: Determines query, number of results, and date range
+- **Analyzes results**: Interprets search results and provides insights
+- **Adapts to user needs**: Can perform multiple searches or skip searching if not needed
+
+This architecture provides:
+- **Agentic Decision-Making**: LLM autonomously decides when and how to use tools
+- **Modularity**: Search functionality is decoupled from the main agent
+- **Extensibility**: Easy to add new search sources or modify search logic
+- **Testability**: MCP server can be tested independently
+- **Reusability**: MCP server can be used by other agents or applications
+
 ## Workflow
 
-The agent follows this LangGraph workflow:
+### Agentic Mode (Default)
+
+The agent uses LangGraph's `create_react_agent` pattern:
+
+1. **User Query**: User asks a question about news
+2. **LLM Decision**: LLM analyzes the query and decides if/when to use `search_news_tool`
+3. **Tool Execution**: If needed, LLM calls `search_news_tool` with appropriate parameters
+4. **Analysis**: LLM analyzes search results and provides insights
+5. **Response**: LLM generates a comprehensive response with citations
+
+The LLM has full autonomy to:
+- Decide whether to search at all
+- Choose search parameters (query, number of results, date range)
+- Perform multiple searches if needed
+- Skip searching if the query doesn't require it
+
+### Legacy Mode
+
+For backward compatibility, the agent can use a deterministic workflow:
 
 1. **Collect Input**: Extracts topic, number of articles, and freshness from user input
-2. **Search News**: Uses Tavily API to search for relevant news articles with date filtering
+2. **Search News**: Uses MCP client to communicate with MCP server, which searches via Tavily API
 3. **Summarize**: Analyzes and summarizes the collected news articles
 4. **Generate Report**: Creates a comprehensive report with citations
+
+## MCP Server
+
+The MCP server runs locally and provides the following tools:
+
+- `search_news`: Search for news articles with query, result count, and date range filtering
+- `get_article_content`: Get full content of a news article (placeholder for future implementation)
+
+The server is automatically started by the MCP client when needed. You can also run it manually:
+
+```bash
+python mcp_news_server.py
+# or
+bash start_mcp_server.sh
+```
 
 ## Output Format
 
@@ -131,10 +190,38 @@ Analysis covers news from the past 7 days.
 You can customize the agent by modifying the `NewsAnalyticAgent` initialization:
 
 ```python
+# Agentic mode (default) - LLM decides when to search
 agent = NewsAnalyticAgent(
     model_name="gpt-4o-mini",  # or "gpt-4", "gpt-3.5-turbo", etc.
-    temperature=0.7  # Adjust creativity (0.0-1.0)
+    temperature=0.7,  # Adjust creativity (0.0-1.0)
+    use_mcp=True,  # Use MCP client (default: True)
+    agentic=True  # Use agentic architecture (default: True)
 )
+
+# Legacy mode - deterministic workflow
+agent = NewsAnalyticAgent(
+    model_name="gpt-4o-mini",
+    temperature=0.7,
+    use_mcp=True,
+    agentic=False  # Use legacy deterministic workflow
+)
+```
+
+### Using MCP Client Directly
+
+You can also use the MCP client independently:
+
+```python
+from mcp_news_client import NewsSearchMCPClientSync
+
+# Use as context manager
+with NewsSearchMCPClientSync() as client:
+    results = client.search_news(
+        query="AI developments",
+        num_results=10,
+        date_range_days=7
+    )
+    print(results)
 ```
 
 ## API Keys
